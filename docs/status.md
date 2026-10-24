@@ -75,7 +75,7 @@ The coordinator serves the web UI. A compromised coordinator can send JavaScript
 
 ### Billing is post-pay
 
-The only check before a request is "balance is more than zero". A balance can go below zero by the cost of one request. If the consumer cancels a stream, the request is billed in full when the provider finishes. A failed request is not billed (BILL-007).
+The only check before a request is "balance is more than zero". A balance can go below zero by the cost of one request. If the consumer cancels a stream or it fails after delivery starts, the request is billed for the input and delivered output tokens (BILL-007).
 
 ### The price ceiling applies to output price only
 

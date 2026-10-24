@@ -22,8 +22,6 @@ from inference_exchange.shared.errors import (
     NoProviderAvailable,
     ProviderError,
     ProviderTimeout,
-    QueueFull,
-    QueueTimeout,
     RateLimitExceeded,
 )
 from inference_exchange.shared.protocol import (
@@ -38,7 +36,6 @@ from .dependencies import (
     _rate_limiter,
     get_auth,
     get_billing,
-    get_event_bus,
     get_hub,
     get_reputation_tracker,
     get_tps_tracker,
@@ -47,6 +44,26 @@ from .dependencies import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _charge_confidential(
+    request_id: str,
+    request: "ConfidentialInferenceRequest",
+    provider,
+    consumer_id: str,
+    output_tokens: int,
+):
+    """Charge the encrypted relay for the output delivered to the consumer."""
+    get_billing().charge_request(
+        request_id=request_id,
+        consumer_id=consumer_id,
+        provider_id=provider.provider_id,
+        model=request.model,
+        input_tokens=request.estimated_input_tokens,
+        output_tokens=output_tokens,
+        price_per_mtok_input=provider.capabilities.price_per_mtok_input,
+        price_per_mtok_output=provider.capabilities.price_per_mtok_output,
+    )
 
 
 class ConfidentialInferenceRequest(BaseModel):
@@ -180,6 +197,8 @@ async def _stream_confidential(
     token_count = 0
     start_time = time.time()
     outcome = "success"
+    completed = False
+    billed = False
     try:
         while True:
             try:
@@ -202,10 +221,9 @@ async def _stream_confidential(
                 if msg.encrypted_token:
                     chunk["ocip_encrypted_token"] = msg.encrypted_token
                 yield f"data: {json.dumps(chunk)}\n\n"
-                if msg.finish_reason:
-                    break
 
             elif isinstance(msg, InferenceDone):
+                completed = True
                 chunk = {
                     "id": f"chatcmpl-{request_id[:8]}",
                     "object": "chat.completion.chunk",
@@ -217,6 +235,7 @@ async def _stream_confidential(
                 break
 
             elif isinstance(msg, InferenceError):
+                completed = True
                 outcome = "error"
                 yield f"data: {json.dumps({'error': {'type': 'provider_error', 'message': msg.error}})}\n\n"
                 break
@@ -225,17 +244,8 @@ async def _stream_confidential(
 
         # Bill using estimated input tokens (coordinator can't count from ciphertext)
         # and provider-reported output tokens (FI-4)
-        billing = get_billing()
-        billing.charge_request(
-            request_id=request_id,
-            consumer_id=consumer_id,
-            provider_id=provider.provider_id,
-            model=request.model,
-            input_tokens=request.estimated_input_tokens,
-            output_tokens=token_count,
-            price_per_mtok_input=provider.capabilities.price_per_mtok_input,
-            price_per_mtok_output=provider.capabilities.price_per_mtok_output,
-        )
+        _charge_confidential(request_id, request, provider, consumer_id, token_count)
+        billed = True
 
         elapsed = time.time() - start_time
         if token_count > 0 and elapsed > 0:
@@ -254,6 +264,13 @@ async def _stream_confidential(
         else:
             reputation.record_error(provider.provider_id)
     finally:
+        if not completed:
+            try:
+                await hub.cancel_request(request_id, output_tokens=token_count)
+            except Exception as e:
+                logger.warning(f"[{request_id[:8]}] Failed to cancel provider request: {e}")
+            if not billed:
+                _charge_confidential(request_id, request, provider, consumer_id, token_count)
         hub.remove_response_queue(request_id)
 
 
@@ -264,6 +281,9 @@ async def _collect_confidential(
     """Collect all encrypted tokens into a single non-streaming response."""
     encrypted_tokens: list[dict] = []
     start_time = time.time()
+    completed = False
+    errored = False
+    token_count = 0
     try:
         while True:
             try:
@@ -275,29 +295,27 @@ async def _collect_confidential(
             if isinstance(msg, InferenceResponseChunk):
                 if msg.encrypted_token:
                     encrypted_tokens.append(msg.encrypted_token)
-                if msg.finish_reason:
-                    break
             elif isinstance(msg, InferenceDone):
+                completed = True
                 break
             elif isinstance(msg, InferenceError):
+                completed = True
+                errored = True
                 get_reputation_tracker().record_error(provider.provider_id)
                 raise ProviderError(msg.error)
     finally:
+        token_count = len(encrypted_tokens)
+        if not completed:
+            try:
+                await hub.cancel_request(request_id, output_tokens=token_count)
+            except Exception as e:
+                logger.warning(f"[{request_id[:8]}] Failed to cancel provider request: {e}")
+        if not completed or errored:
+            _charge_confidential(request_id, request, provider, consumer_id, token_count)
         hub.remove_response_queue(request_id)
 
     token_count = len(encrypted_tokens)
-
-    billing = get_billing()
-    billing.charge_request(
-        request_id=request_id,
-        consumer_id=consumer_id,
-        provider_id=provider.provider_id,
-        model=request.model,
-        input_tokens=request.estimated_input_tokens,
-        output_tokens=token_count,
-        price_per_mtok_input=provider.capabilities.price_per_mtok_input,
-        price_per_mtok_output=provider.capabilities.price_per_mtok_output,
-    )
+    _charge_confidential(request_id, request, provider, consumer_id, token_count)
 
     elapsed = time.time() - start_time
     if token_count > 0 and elapsed > 0:

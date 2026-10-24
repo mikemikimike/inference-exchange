@@ -199,7 +199,11 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         return JSONResponse({"error": {"message": validation_error, "type": "invalid_request"}}, status_code=400)
 
     # Resolve consumer identity from auth header or JWT
-    from .routes_auth import anonymous_inference_blocked, resolve_user_from_request, sign_in_required_response
+    from .routes_auth import (
+        anonymous_inference_blocked,
+        resolve_user_from_request,
+        sign_in_required_response,
+    )
     user_info = resolve_user_from_request(raw_request)
     if user_info:
         consumer_id = user_info["user_id"]
@@ -543,6 +547,7 @@ async def _stream_response(
     """
     token_count = 0
     outcome = "success"
+    completed = False
     try:
         while True:
             try:
@@ -577,6 +582,7 @@ async def _stream_response(
                 # Don't break on finish_reason — wait for InferenceDone
 
             elif isinstance(msg, InferenceDone):
+                completed = True
                 chunk = {
                     "id": f"chatcmpl-{request_id[:8]}",
                     "object": "chat.completion.chunk",
@@ -588,6 +594,7 @@ async def _stream_response(
                 break
 
             elif isinstance(msg, InferenceError):
+                completed = True
                 outcome = "disconnect" if msg.error == "provider_disconnected" else "error"
                 error_data = {"error": {"message": msg.error, "type": "provider_error"}}
                 yield f"data: {json.dumps(error_data)}\n\n"
@@ -607,6 +614,11 @@ async def _stream_response(
         elif outcome == "error":
             reputation.record_error(provider.provider_id)
     finally:
+        if not completed:
+            try:
+                await hub.cancel_request(request_id, output_tokens=token_count)
+            except Exception as e:
+                logger.warning(f"[{request_id[:8]}] Failed to cancel provider request: {e}")
         hub.remove_response_queue(request_id)
 
 
@@ -620,13 +632,12 @@ async def _collect_response(
     """
     tokens: list[str] = []
     done_msg_ns: InferenceDone | None = None
-    outcome = "success"
+    completed = False
     try:
         while True:
             try:
                 msg = await asyncio.wait_for(queue.get(), timeout=120.0)
             except asyncio.TimeoutError:
-                outcome = "timeout"
                 reputation = get_reputation_tracker()
                 reputation.record_timeout(provider.provider_id)
                 raise ProviderTimeout()
@@ -636,13 +647,19 @@ async def _collect_response(
                 # Don't break on finish_reason — wait for InferenceDone
             elif isinstance(msg, InferenceDone):
                 done_msg_ns = msg
+                completed = True
                 break
             elif isinstance(msg, InferenceError):
-                outcome = "error"
+                completed = True
                 reputation = get_reputation_tracker()
                 reputation.record_error(provider.provider_id)
                 raise ProviderError(msg.error)
     finally:
+        if not completed:
+            try:
+                await hub.cancel_request(request_id, output_tokens=len(tokens))
+            except Exception as e:
+                logger.warning(f"[{request_id[:8]}] Failed to cancel provider request: {e}")
         hub.remove_response_queue(request_id)
 
     # Record reputation — success

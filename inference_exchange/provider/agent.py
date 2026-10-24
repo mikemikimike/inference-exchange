@@ -22,7 +22,7 @@ import time
 import websockets
 
 from inference_exchange.config import ProviderConfig
-from inference_exchange.shared.crypto import KeyPair, EncryptedPayload, decrypt_json
+from inference_exchange.shared.crypto import EncryptedPayload, KeyPair, decrypt_json
 from inference_exchange.shared.protocol import (
     HeartbeatMessage,
     InferenceDone,
@@ -66,6 +66,7 @@ class ProviderAgent:
         self.model_identity = model_identity or {}
         self._ws = None
         self._active_requests = 0
+        self._active_request_tasks: dict[str, asyncio.Task] = {}
         self._running = False
         # Generate X25519 keypair for E2E encryption
         self._keypair = KeyPair()
@@ -125,16 +126,23 @@ class ProviderAgent:
                         req = InferenceRequest(**data)
                         # Handle inference in a separate task so we can process
                         # multiple requests concurrently
-                        asyncio.create_task(self._handle_inference(ws, req))
+                        task = asyncio.create_task(self._handle_inference(ws, req))
+                        self._active_request_tasks[req.request_id] = task
 
                     elif msg_type == MessageType.CANCEL_REQUEST:
-                        # TODO: implement cancellation
-                        logger.info(f"Cancel requested for {data.get('request_id')}")
+                        request_id = data.get("request_id", "")
+                        task = self._active_request_tasks.get(request_id)
+                        if task:
+                            task.cancel()
+                            logger.info(f"[{request_id[:8]}] Cancelled")
 
                     else:
                         logger.debug(f"Unknown message type: {msg_type}")
             finally:
                 heartbeat_task.cancel()
+                for task in self._active_request_tasks.values():
+                    task.cancel()
+                self._active_request_tasks.clear()
 
     async def _handle_inference(self, ws, req: InferenceRequest):
         """Run inference and stream results back to coordinator."""
@@ -189,6 +197,16 @@ class ProviderAgent:
                 f"in {elapsed:.1f}s ({tps:.1f} tok/s)"
             )
 
+        except asyncio.CancelledError:
+            logger.info(f"[{req.request_id[:8]}] Cancelled by coordinator")
+            try:
+                await ws.send(InferenceError(
+                    request_id=req.request_id,
+                    error="cancelled",
+                ).model_dump_json())
+            except Exception:
+                pass
+            raise
         except Exception as e:
             logger.error(f"[{req.request_id[:8]}] Inference error: {e}")
             error = InferenceError(request_id=req.request_id, error=str(e))
@@ -198,6 +216,7 @@ class ProviderAgent:
                 pass
         finally:
             self._active_requests -= 1
+            self._active_request_tasks.pop(req.request_id, None)
 
     async def _heartbeat_loop(self, ws):
         """Send periodic heartbeats to coordinator."""

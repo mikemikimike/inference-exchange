@@ -55,8 +55,8 @@ MUST: When a provider completes a request, the system bills the consumer.
 MUST: If a stream fails or the consumer cancels it, bill only for the tokens that the provider delivered.
 
 - Principle: P7
-- Status: not-implemented
-- Issue: #59
+- Status: implemented
+- Verified by: tests/test_cancellation.py::test_stream_cancellation_bills_delivered_tokens, tests/test_cancellation.py::test_provider_error_bills_delivered_tokens
 
 ### BILL-008: Balances persist
 

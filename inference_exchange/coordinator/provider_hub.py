@@ -4,6 +4,7 @@ import asyncio
 import logging
 import secrets
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from fastapi import WebSocket
@@ -11,6 +12,7 @@ from fastapi import WebSocket
 from inference_exchange.shared.protocol import (
     AttestationChallenge,
     AttestationResponse,
+    CancelRequest,
     HeartbeatMessage,
     InferenceDone,
     InferenceError,
@@ -71,7 +73,12 @@ class ConnectedProvider:
         return self.active_requests / self.capabilities.max_concurrent
 
     def score_for_request(self, model: str, preference: str = "balanced") -> float:
-        from .matching.models import ConfidenceLevel, InferenceOrder, ProviderOffer, RoutingPreference
+        from .matching.models import (
+            ConfidenceLevel,
+            InferenceOrder,
+            ProviderOffer,
+            RoutingPreference,
+        )
         from .matching.strategy import compute_score
 
         pref_map = {
@@ -127,7 +134,9 @@ class ProviderHub:
         self._request_to_provider: dict[str, str] = {}
         self._pending_queue: asyncio.Queue[PendingRequest] = asyncio.Queue(maxsize=self.QUEUE_MAX_DEPTH)
         # Billing callbacks keyed by request_id, invoked when InferenceDone arrives
-        self._billing_callbacks: dict[str, callable] = {}
+        self._billing_callbacks: dict[str, Callable[[InferenceDone], None]] = {}
+        self._delivered_tokens: dict[str, int] = {}
+        self._terminal_requests: set[str] = set()
 
     @property
     def provider_count(self) -> int:
@@ -165,10 +174,20 @@ class ProviderHub:
             name = provider.name
             orphaned_requests = [req_id for req_id, pid in self._request_to_provider.items() if pid == provider_id]
             for req_id in orphaned_requests:
+                self._terminal_requests.add(req_id)
                 if req_id in self._response_queues:
                     self._response_queues[req_id].put_nowait(
                         InferenceError(request_id=req_id, error="provider_disconnected")
                     )
+                callback = self._billing_callbacks.pop(req_id, None)
+                if callback:
+                    try:
+                        callback(InferenceDone(
+                            request_id=req_id,
+                            tokens_generated=self._delivered_tokens.get(req_id, 0),
+                        ))
+                    except Exception as e:
+                        logger.error(f"Billing callback error for {req_id[:8]}: {e}")
                 self._request_to_provider.pop(req_id, None)
             del self._providers[provider_id]
             logger.info(f"Provider disconnected: {name} ({provider_id})")
@@ -178,7 +197,12 @@ class ProviderHub:
     def select_provider(self, model: str, preference: str = "balanced",
                         min_confidence: str = "open", max_price: float | None = None,
                         session_id: str | None = None, reputation_fn=None) -> ConnectedProvider | None:
-        from .matching.models import ConfidenceLevel, InferenceOrder, ProviderOffer, RoutingPreference
+        from .matching.models import (
+            ConfidenceLevel,
+            InferenceOrder,
+            ProviderOffer,
+            RoutingPreference,
+        )
         from .matching.strategy import GreedyStrategy
 
         pref_map = {"cheapest": RoutingPreference.CHEAPEST, "fastest": RoutingPreference.FASTEST,
@@ -228,23 +252,61 @@ class ProviderHub:
     def create_response_queue(self, request_id: str) -> asyncio.Queue:
         queue: asyncio.Queue = asyncio.Queue()
         self._response_queues[request_id] = queue
+        self._delivered_tokens[request_id] = 0
+        self._terminal_requests.discard(request_id)
         return queue
 
     def remove_response_queue(self, request_id: str):
         self._response_queues.pop(request_id, None)
         self._request_to_provider.pop(request_id, None)
         self._billing_callbacks.pop(request_id, None)
+        self._delivered_tokens.pop(request_id, None)
+        self._terminal_requests.discard(request_id)
 
-    def register_billing_callback(self, request_id: str, callback: callable):
+    def register_billing_callback(
+        self, request_id: str, callback: Callable[[InferenceDone], None]
+    ):
         """Register a callback invoked when InferenceDone arrives for this request."""
         self._billing_callbacks[request_id] = callback
+
+    async def cancel_request(self, request_id: str, output_tokens: int | None = None) -> bool:
+        """Stop an active provider request and settle billing for delivered output."""
+        if request_id in self._terminal_requests:
+            return False
+
+        delivered = self._delivered_tokens.get(request_id, 0)
+        output_tokens = delivered if output_tokens is None else max(0, output_tokens)
+        callback = self._billing_callbacks.pop(request_id, None)
+        if callback:
+            try:
+                callback(InferenceDone(request_id=request_id, tokens_generated=output_tokens))
+            except Exception as e:
+                logger.error(f"Billing callback error for {request_id[:8]}: {e}")
+
+        provider_id = self._request_to_provider.get(request_id)
+        provider = self._providers.get(provider_id) if provider_id else None
+        if provider is None:
+            return callback is not None
+
+        try:
+            await provider.ws.send_json(CancelRequest(request_id=request_id).model_dump())
+        except Exception as e:
+            logger.warning(f"Cancel request failed for {request_id[:8]}: {e}")
+        provider.active_requests = max(0, provider.active_requests - 1)
+        asyncio.create_task(self._try_dispatch_queued(freed_provider_id=provider.provider_id))
+        return True
 
     async def send_to_provider(self, provider: ConnectedProvider, request: InferenceRequest):
         if not provider.admitted and provider.requires_app_attest:
             raise PermissionError("provider is not App Attest admitted")
         provider.active_requests += 1
         self._request_to_provider[request.request_id] = provider.provider_id
-        await provider.ws.send_json(request.model_dump())
+        try:
+            await provider.ws.send_json(request.model_dump())
+        except Exception:
+            provider.active_requests = max(0, provider.active_requests - 1)
+            self._request_to_provider.pop(request.request_id, None)
+            raise
 
     def enqueue_request(self, inference_req: InferenceRequest, *, model: str = "default",
                         preference: str = "balanced", min_confidence: str = "open",
@@ -294,6 +356,7 @@ class ProviderHub:
         # the queue before InferenceDone arrives from the provider).
         if msg_type == MessageType.INFERENCE_DONE:
             done_msg = InferenceDone(**data)
+            self._terminal_requests.add(request_id)
             # Deliver to queue if it still exists (streaming generator reads it)
             queue = self._response_queues.get(request_id)
             if queue is not None:
@@ -316,9 +379,19 @@ class ProviderHub:
         queue = self._response_queues[request_id]
         if msg_type == MessageType.INFERENCE_RESPONSE:
             queue.put_nowait(InferenceResponseChunk(**data))
+            self._delivered_tokens[request_id] = self._delivered_tokens.get(request_id, 0) + 1
         elif msg_type == MessageType.INFERENCE_ERROR:
             queue.put_nowait(InferenceError(**data))
-            self._billing_callbacks.pop(request_id, None)
+            self._terminal_requests.add(request_id)
+            callback = self._billing_callbacks.pop(request_id, None)
+            if callback:
+                try:
+                    callback(InferenceDone(
+                        request_id=request_id,
+                        tokens_generated=self._delivered_tokens.get(request_id, 0),
+                    ))
+                except Exception as e:
+                    logger.error(f"Billing callback error for {request_id[:8]}: {e}")
             if provider_id in self._providers:
                 self._providers[provider_id].active_requests = max(0, self._providers[provider_id].active_requests - 1)
             asyncio.ensure_future(self._try_dispatch_queued(freed_provider_id=provider_id))
